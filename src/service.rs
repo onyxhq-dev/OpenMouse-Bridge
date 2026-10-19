@@ -236,6 +236,8 @@ pub struct BridgeService {
     config_path: Arc<PathBuf>,
     notice_listener: Arc<std::sync::Mutex<Option<NoticeListener>>>,
     show_panel: Arc<std::sync::Mutex<Option<Arc<dyn Fn() + Send + Sync>>>>,
+    /// Acts on the mouse's side buttons while a game's profile assigns them.
+    buttons: Arc<crate::buttons::ButtonListener>,
 }
 
 struct BridgeState {
@@ -350,6 +352,7 @@ impl BridgeService {
             config_path: Arc::new(config_path),
             notice_listener: Arc::default(),
             show_panel: Arc::default(),
+            buttons: Arc::default(),
         }
     }
 
@@ -778,7 +781,15 @@ impl BridgeService {
                     }
                 }
                 let default = state.config.default_profile.clone();
+                let desired_buttons = state
+                    .applied_profile
+                    .as_ref()
+                    .and_then(crate::buttons::Assignments::from_profile);
                 drop(state);
+                // A control panel holding the mouse is not interrupted by a new helper.
+                service
+                    .buttons
+                    .update(desired_buttons, !crate::hid::client_session_active());
                 if let Some((current, previous, announce)) = switch {
                     let service = service.clone();
                     std::thread::spawn(move || {
