@@ -149,6 +149,24 @@ fn profile_key(profile: &ApplicationProfile) -> String {
     }
 }
 
+/// The profile `key` names as it is in the config now, and whether it is the
+/// default profile. A profile keeps its key while its settings are edited, so
+/// the copy Bridge applied earlier can be out of date.
+fn current_profile<'a>(config: &'a BridgeConfig, key: &str) -> Option<(&'a ApplicationProfile, bool)> {
+    config
+        .profiles
+        .iter()
+        .find(|profile| profile_key(profile) == key)
+        .map(|profile| (profile, false))
+        .or_else(|| {
+            config
+                .default_profile
+                .as_ref()
+                .filter(|profile| profile_key(profile) == key)
+                .map(|profile| (profile, true))
+        })
+}
+
 /// Something worth telling the user about, already worded: a title such as the
 /// game's name and a short detail line.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -785,10 +803,13 @@ impl BridgeService {
                     }
                 }
                 let default = state.config.default_profile.clone();
-                let desired_buttons = state.applied_profile.as_ref().and_then(|profile| {
-                    let is_default = state.config.default_profile.as_ref() == Some(profile);
-                    crate::buttons::Assignments::from_profile(profile, is_default)
-                });
+                // Read from the config each time: editing the active profile's
+                // keys does not change its key, so the applied copy goes stale.
+                let desired_buttons = state
+                    .active_profile_key
+                    .as_deref()
+                    .and_then(|key| current_profile(&state.config, key))
+                    .and_then(|(profile, is_default)| crate::buttons::Assignments::from_profile(profile, is_default));
                 drop(state);
                 // A control panel holding the mouse is not interrupted by a new helper.
                 service
@@ -897,6 +918,24 @@ mod tests {
             foreground,
             icon_id: String::new(),
         }
+    }
+
+    #[test]
+    fn the_active_profile_is_read_from_the_config_so_edits_are_seen() {
+        let mut config = BridgeConfig::default();
+        config.default_profile = Some(test_profile("Default", "", Some(800), None));
+        config.profiles = vec![test_profile("Valorant", "/games/valorant", Some(800), None)];
+
+        let (game, is_default) = current_profile(&config, "/games/valorant").expect("the game profile");
+        assert_eq!((game.application.name.as_str(), is_default), ("Valorant", false));
+        let (default, is_default) = current_profile(&config, "default").expect("the default profile");
+        assert_eq!((default.application.name.as_str(), is_default), ("Default", true));
+
+        // Editing a profile keeps its key, so the lookup finds the new settings.
+        config.default_profile = Some(test_profile("Default", "", Some(1600), None));
+        let (edited, _) = current_profile(&config, "default").expect("the edited default profile");
+        assert_eq!(edited.settings.dpi, Some(1600));
+        assert!(current_profile(&config, "/games/other").is_none());
     }
 
     #[test]

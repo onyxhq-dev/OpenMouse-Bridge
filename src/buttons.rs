@@ -206,7 +206,8 @@ pub struct ButtonListener {
 }
 
 struct Running {
-    assignments: Assignments,
+    /// Shared with the listener thread, so new assignments reach it without a restart.
+    assignments: Arc<Mutex<Assignments>>,
     stop: mpsc::Sender<()>,
     thread: JoinHandle<()>,
 }
@@ -219,7 +220,25 @@ impl Running {
     }
 
     fn matches(&self, desired: Option<&Assignments>) -> bool {
-        Some(&self.assignments) == desired && !self.thread.is_finished()
+        let mine = self.assignments.lock().unwrap_or_else(PoisonError::into_inner);
+        Some(&*mine) == desired && !self.thread.is_finished()
+    }
+
+    /// Hands the listener new assignments if it is for the same mouse and the same
+    /// kind of profile; anything else needs a new helper.
+    fn retarget(&self, wanted: &Assignments) -> bool {
+        if self.thread.is_finished() {
+            return false;
+        }
+        let mut mine = self.assignments.lock().unwrap_or_else(PoisonError::into_inner);
+        if mine.brand != wanted.brand || mine.require_host != wanted.require_host {
+            return false;
+        }
+        if *mine != *wanted {
+            *mine = wanted.clone();
+            tracing::info!("Updated the button assignments");
+        }
+        true
     }
 }
 
@@ -229,6 +248,14 @@ impl ButtonListener {
     /// the mouse, so a new helper does not open it underneath. Stopping and
     /// starting wait on the helper, so they run off the caller's thread.
     pub fn update(self: &Arc<Self>, desired: Option<Assignments>, may_start: bool) {
+        // New keys for a listener that is already running need no helper at
+        // all, so they are applied at once even while a panel holds the mouse.
+        if let Some(wanted) = desired.as_ref() {
+            let running = self.running.lock().unwrap_or_else(PoisonError::into_inner);
+            if running.as_ref().is_some_and(|current| current.retarget(wanted)) {
+                return;
+            }
+        }
         if self.in_step_with(desired.as_ref()) || (desired.is_some() && !may_start) {
             return;
         }
@@ -293,15 +320,16 @@ fn start(assignments: Assignments) -> Result<Running> {
     let stdout = child.stdout.take().context("the button helper's stdout was unavailable")?;
     let (stop, stopped) = mpsc::channel();
     let (ready, started) = mpsc::channel();
-    let keys = assignments.clone();
+    let shared = Arc::new(Mutex::new(assignments));
+    let for_thread = Arc::clone(&shared);
     let thread = thread::Builder::new()
         .name("openmouse-bridge-buttons".into())
-        .spawn(move || run(child, stdin, stdout, &keys, &stopped, &ready))
+        .spawn(move || run(child, stdin, stdout, &for_thread, &stopped, &ready))
         .context("could not start the button listener thread")?;
     let _ = started.recv_timeout(START_TIMEOUT);
     drop(access);
     Ok(Running {
-        assignments,
+        assignments: shared,
         stop,
         thread,
     })
@@ -311,14 +339,16 @@ fn run(
     mut child: Child,
     mut stdin: ChildStdin,
     stdout: std::process::ChildStdout,
-    assignments: &Assignments,
+    shared: &Mutex<Assignments>,
     stopped: &mpsc::Receiver<()>,
     ready: &mpsc::Sender<()>,
 ) {
+    let current = |shared: &Mutex<Assignments>| shared.lock().unwrap_or_else(PoisonError::into_inner).clone();
+    let first = current(shared);
     let request = format!(
         "{{\"brand\":{},\"requireHost\":{}}}\n",
-        Value::from(assignments.brand.as_str()),
-        assignments.require_host
+        Value::from(first.brand.as_str()),
+        first.require_host
     );
     if stdin.write_all(request.as_bytes()).and_then(|()| stdin.flush()).is_err() {
         tracing::warn!("Could not start the button helper");
@@ -356,7 +386,8 @@ fn run(
         }
         match incoming.recv_timeout(Duration::from_millis(100)) {
             Ok(Event::Buttons(mask)) => {
-                for step in steps(assignments, held, mask) {
+                for step in steps(&current(shared), held, mask) {
+                    tracing::info!(mask, ?step, "Acting on a mouse button");
                     execute(step);
                 }
                 held = mask;
@@ -379,7 +410,7 @@ fn run(
 
     // Let go of anything still held, then close stdin: the helper stops the
     // events and puts the mouse back in the mode it was in.
-    for step in steps(assignments, held, 0) {
+    for step in steps(&current(shared), held, 0) {
         execute(step);
     }
     drop(stdin);
