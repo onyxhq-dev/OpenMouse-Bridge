@@ -546,6 +546,10 @@ impl BridgeService {
         config::save(&self.config_path, &config)
     }
 
+    pub async fn default_profile(&self) -> Option<ApplicationProfile> {
+        self.inner.read().await.config.default_profile.clone()
+    }
+
     pub async fn set_default_profile(&self, profile: ApplicationProfile) -> Result<()> {
         let config = {
             let mut state = self.inner.write().await;
@@ -781,10 +785,10 @@ impl BridgeService {
                     }
                 }
                 let default = state.config.default_profile.clone();
-                let desired_buttons = state
-                    .applied_profile
-                    .as_ref()
-                    .and_then(crate::buttons::Assignments::from_profile);
+                let desired_buttons = state.applied_profile.as_ref().and_then(|profile| {
+                    let is_default = state.config.default_profile.as_ref() == Some(profile);
+                    crate::buttons::Assignments::from_profile(profile, is_default)
+                });
                 drop(state);
                 // A control panel holding the mouse is not interrupted by a new helper.
                 service

@@ -74,12 +74,16 @@ pub struct Assignments {
     /// The brand the profile names ("Logitech"), which the helper picks its driver by.
     pub brand: String,
     pub actions: BTreeMap<u8, Action>,
+    /// Set for the default profile: it only listens to a mouse that is already
+    /// on the Host profile, and never switches one to it.
+    pub require_host: bool,
 }
 
 impl Assignments {
     /// The assignments a profile carries, or `None` when it has none or is not
     /// for a Logitech mouse (the only brand with the button events).
-    pub fn from_profile(profile: &ApplicationProfile) -> Option<Self> {
+    /// `is_default` marks the profile Bridge uses when no game's is active.
+    pub fn from_profile(profile: &ApplicationProfile, is_default: bool) -> Option<Self> {
         let brand = profile.device.id.split(':').next().unwrap_or_default();
         if !brand.eq_ignore_ascii_case("logitech") {
             return None;
@@ -104,6 +108,7 @@ impl Assignments {
         (!actions.is_empty()).then(|| Self {
             brand: brand.to_owned(),
             actions,
+            require_host: is_default,
         })
     }
 }
@@ -310,7 +315,11 @@ fn run(
     stopped: &mpsc::Receiver<()>,
     ready: &mpsc::Sender<()>,
 ) {
-    let request = format!("{{\"brand\":{}}}\n", Value::from(assignments.brand.as_str()));
+    let request = format!(
+        "{{\"brand\":{},\"requireHost\":{}}}\n",
+        Value::from(assignments.brand.as_str()),
+        assignments.require_host
+    );
     if stdin.write_all(request.as_bytes()).and_then(|()| stdin.flush()).is_err() {
         tracing::warn!("Could not start the button helper");
     }
@@ -539,6 +548,7 @@ mod tests {
                 .iter()
                 .map(|&(bit, usage, modifiers)| (bit, Action::Key(KeyAction { usage, modifiers })))
                 .collect(),
+            require_host: false,
         }
     }
 
@@ -547,7 +557,7 @@ mod tests {
         let parsed = Assignments::from_profile(&profile(
             "Logitech:PRO X3 SUPERSTRIKE",
             json!({"hostButtons": {"16": {"key": 104, "modifiers": 0}, "8": {"key": 4, "modifiers": 3}}}),
-        ))
+        ), false)
         .expect("assignments");
         assert_eq!(parsed.brand, "Logitech");
         assert_eq!(parsed.actions[&FRONT], Action::Key(KeyAction { usage: 104, modifiers: 0 }));
@@ -559,23 +569,24 @@ mod tests {
         let parsed = Assignments::from_profile(&profile(
             "Logitech:Mouse",
             json!({"hostButtons": {"16": {"consumer": 233}}}),
-        ))
+        ), true)
         .expect("assignments");
         assert_eq!(parsed.actions[&FRONT], Action::Media(233));
-        let unknown = Assignments::from_profile(&profile("Logitech:Mouse", json!({"hostButtons": {"16": {"consumer": 1}}})));
+        assert!(parsed.require_host, "the default profile only listens to a mouse already on Host");
+        let unknown = Assignments::from_profile(&profile("Logitech:Mouse", json!({"hostButtons": {"16": {"consumer": 1}}})), false);
         assert_eq!(unknown, None, "a media key Bridge cannot press is not accepted");
     }
 
     #[test]
     fn profiles_without_usable_assignments_start_nothing() {
-        let logitech = |snapshot| Assignments::from_profile(&profile("Logitech:Mouse", snapshot));
+        let logitech = |snapshot| Assignments::from_profile(&profile("Logitech:Mouse", snapshot), false);
         assert_eq!(logitech(json!({})), None);
         assert_eq!(logitech(json!({"hostButtons": {}})), None);
         assert_eq!(logitech(json!({"hostButtons": {"4": {"key": 4}}})), None, "the middle button is not assignable");
         assert_eq!(logitech(json!({"hostButtons": {"8": {"key": 999}}})), None);
         assert_eq!(logitech(json!({"hostButtons": {"8": {"key": 4, "modifiers": 99}}})), None);
         let other = profile("Razer:Viper", json!({"hostButtons": {"8": {"key": 4}}}));
-        assert_eq!(Assignments::from_profile(&other), None, "only Logitech has the button events");
+        assert_eq!(Assignments::from_profile(&other, false), None, "only Logitech has the button events");
     }
 
     #[test]

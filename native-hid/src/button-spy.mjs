@@ -2,7 +2,8 @@
 // Long-running helper Bridge spawns while a game profile has button
 // assignments for a Logitech mouse running from software (Host mode).
 //
-// stdin: one JSON line to start, e.g. {"brand": "Logitech"}. Closing stdin (or
+// stdin: one JSON line to start, e.g. {"brand": "Logitech"}; add
+//   "requireHost": true to listen only to a mouse already on Host. Closing stdin (or
 //   SIGTERM/SIGINT) stops it: the spy is switched off and the mouse goes back
 //   to the mode it was in, if this helper changed it.
 // stdout: one JSON object per line.
@@ -81,6 +82,13 @@ async function main(input) {
 
   const { client, status } = await findClient(entry);
   const priorMode = status?.deviceMode ?? "Unknown";
+  // The default profile only listens to a mouse already on Host; it never
+  // switches one over, so a mouse on an onboard profile is left alone.
+  if (input.requireHost === true && priorMode !== "Host") {
+    emit({ event: "error", message: "the mouse is not on the Host profile" });
+    await client.close().catch(() => undefined);
+    process.exit(EXIT_FAILED);
+  }
   let changedMode = false;
   let stopping = false;
 

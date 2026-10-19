@@ -65,7 +65,7 @@ pub fn router(service: BridgeService, origins: &[String]) -> Router {
         .route("/v1/applications/{icon_id}/icon", get(application_icon))
         .route("/v1/running-applications", get(running_applications))
         .route("/v1/profiles", get(profiles).put(replace_profiles))
-        .route("/v1/default-profile", put(set_default_profile))
+        .route("/v1/default-profile", get(default_profile).put(set_default_profile))
         .route("/v1/native/settings", put(apply_native_settings))
         .route("/v1/battery", put(record_battery))
         .route("/v1/autostart", put(set_autostart))
@@ -174,6 +174,10 @@ async fn replace_profiles(
         .await
         .map_err(internal_error)?;
     Ok(Json(ApiResult { ok: true }))
+}
+
+async fn default_profile(State(service): State<BridgeService>) -> Json<Option<ApplicationProfile>> {
+    Json(service.default_profile().await)
 }
 
 async fn set_default_profile(
