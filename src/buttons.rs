@@ -49,11 +49,20 @@ pub struct KeyAction {
     pub modifiers: u8,
 }
 
+/// What a pressed button does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Action {
+    /// A keyboard key and its modifiers.
+    Key(KeyAction),
+    /// A media key, by its HID consumer usage (volume, play/pause, ...).
+    Media(u16),
+}
+
 /// One thing to do to the system.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Step {
-    KeyDown(KeyAction),
-    KeyUp(KeyAction),
+    Down(Action),
+    Up(Action),
     /// Press the side button's normal click: `BACK` is Back, `FRONT` is Forward.
     SideDown(u8),
     SideUp(u8),
@@ -64,7 +73,7 @@ pub enum Step {
 pub struct Assignments {
     /// The brand the profile names ("Logitech"), which the helper picks its driver by.
     pub brand: String,
-    pub keys: BTreeMap<u8, KeyAction>,
+    pub actions: BTreeMap<u8, Action>,
 }
 
 impl Assignments {
@@ -76,18 +85,25 @@ impl Assignments {
             return None;
         }
         let buttons = profile.settings.snapshot.as_ref()?.get("hostButtons")?.as_object()?;
-        let mut keys = BTreeMap::new();
+        let mut actions = BTreeMap::new();
         for (bit, action) in buttons {
             let bit: u8 = bit.parse().ok().filter(|bit| SIDE_BUTTONS.contains(bit))?;
-            let usage = u8::try_from(action.get("key")?.as_u64()?).ok()?;
-            let modifiers = u8::try_from(action.get("modifiers").and_then(Value::as_u64).unwrap_or(0))
-                .ok()
-                .filter(|modifiers| *modifiers <= 0x0f)?;
-            keys.insert(bit, KeyAction { usage, modifiers });
+            let action = if let Some(usage) = action.get("consumer") {
+                let usage = u16::try_from(usage.as_u64()?).ok()?;
+                media_virtual_key(usage)?;
+                Action::Media(usage)
+            } else {
+                let usage = u8::try_from(action.get("key")?.as_u64()?).ok()?;
+                let modifiers = u8::try_from(action.get("modifiers").and_then(Value::as_u64).unwrap_or(0))
+                    .ok()
+                    .filter(|modifiers| *modifiers <= 0x0f)?;
+                Action::Key(KeyAction { usage, modifiers })
+            };
+            actions.insert(bit, action);
         }
-        (!keys.is_empty()).then(|| Self {
+        (!actions.is_empty()).then(|| Self {
             brand: brand.to_owned(),
-            keys,
+            actions,
         })
     }
 }
@@ -101,9 +117,9 @@ pub fn steps(assignments: &Assignments, previous: u8, now: u8) -> Vec<Step> {
         if was == is {
             continue;
         }
-        steps.push(match (assignments.keys.get(&bit), is) {
-            (Some(action), true) => Step::KeyDown(*action),
-            (Some(action), false) => Step::KeyUp(*action),
+        steps.push(match (assignments.actions.get(&bit), is) {
+            (Some(action), true) => Step::Down(*action),
+            (Some(action), false) => Step::Up(*action),
             (None, true) => Step::SideDown(bit),
             (None, false) => Step::SideUp(bit),
         });
@@ -149,6 +165,20 @@ pub fn virtual_key(usage: u8) -> Option<u16> {
         0x51 => 0x28,                                  // Down
         0x52 => 0x26,                                  // Up
         0x68..=0x73 => 0x7c + u16::from(usage - 0x68), // F13-F24
+        _ => return None,
+    })
+}
+
+/// The Windows virtual-key code for a HID consumer usage (media key).
+pub fn media_virtual_key(usage: u16) -> Option<u16> {
+    Some(match usage {
+        0xe2 => 0xad, // Mute
+        0xe9 => 0xaf, // Volume up
+        0xea => 0xae, // Volume down
+        0xcd => 0xb3, // Play / pause
+        0xb5 => 0xb0, // Next track
+        0xb6 => 0xb1, // Previous track
+        0xb7 => 0xb2, // Stop
         _ => return None,
     })
 }
@@ -376,15 +406,37 @@ mod inject {
     };
     use windows_sys::Win32::UI::WindowsAndMessaging::{XBUTTON1, XBUTTON2};
 
-    use super::{BACK, KeyAction, Step, modifier_keys, virtual_key};
+    use super::{Action, BACK, KeyAction, Step, media_virtual_key, modifier_keys, virtual_key};
 
     pub fn execute(step: Step) {
         match step {
-            Step::KeyDown(action) => keys(action, true),
-            Step::KeyUp(action) => keys(action, false),
+            Step::Down(Action::Key(action)) => keys(action, true),
+            Step::Up(Action::Key(action)) => keys(action, false),
+            Step::Down(Action::Media(usage)) => media(usage, true),
+            Step::Up(Action::Media(usage)) => media(usage, false),
             Step::SideDown(bit) => side(bit, true),
             Step::SideUp(bit) => side(bit, false),
         }
+    }
+
+    /// Media keys have no scan code of their own, so they go by virtual key.
+    fn media(usage: u16, down: bool) {
+        let Some(vk) = media_virtual_key(usage) else {
+            return;
+        };
+        let flags = KEYEVENTF_EXTENDEDKEY | if down { 0 } else { KEYEVENTF_KEYUP };
+        send(&[INPUT {
+            r#type: INPUT_KEYBOARD,
+            Anonymous: INPUT_0 {
+                ki: KEYBDINPUT {
+                    wVk: vk,
+                    wScan: 0,
+                    dwFlags: flags,
+                    time: 0,
+                    dwExtraInfo: 0,
+                },
+            },
+        }]);
     }
 
     /// Modifiers go down before the key and come up after it.
@@ -483,9 +535,9 @@ mod tests {
     fn assignments(keys: &[(u8, u8, u8)]) -> Assignments {
         Assignments {
             brand: "Logitech".into(),
-            keys: keys
+            actions: keys
                 .iter()
-                .map(|&(bit, usage, modifiers)| (bit, KeyAction { usage, modifiers }))
+                .map(|&(bit, usage, modifiers)| (bit, Action::Key(KeyAction { usage, modifiers })))
                 .collect(),
         }
     }
@@ -498,8 +550,20 @@ mod tests {
         ))
         .expect("assignments");
         assert_eq!(parsed.brand, "Logitech");
-        assert_eq!(parsed.keys[&FRONT], KeyAction { usage: 104, modifiers: 0 });
-        assert_eq!(parsed.keys[&BACK], KeyAction { usage: 4, modifiers: 3 });
+        assert_eq!(parsed.actions[&FRONT], Action::Key(KeyAction { usage: 104, modifiers: 0 }));
+        assert_eq!(parsed.actions[&BACK], Action::Key(KeyAction { usage: 4, modifiers: 3 }));
+    }
+
+    #[test]
+    fn a_profile_can_assign_a_media_key() {
+        let parsed = Assignments::from_profile(&profile(
+            "Logitech:Mouse",
+            json!({"hostButtons": {"16": {"consumer": 233}}}),
+        ))
+        .expect("assignments");
+        assert_eq!(parsed.actions[&FRONT], Action::Media(233));
+        let unknown = Assignments::from_profile(&profile("Logitech:Mouse", json!({"hostButtons": {"16": {"consumer": 1}}})));
+        assert_eq!(unknown, None, "a media key Bridge cannot press is not accepted");
     }
 
     #[test]
@@ -517,10 +581,10 @@ mod tests {
     #[test]
     fn a_press_and_release_become_one_key_down_and_up() {
         let assigned = assignments(&[(FRONT, 0x68, 0)]);
-        let action = KeyAction { usage: 0x68, modifiers: 0 };
-        assert_eq!(steps(&assigned, 0, FRONT), [Step::KeyDown(action)]);
+        let action = Action::Key(KeyAction { usage: 0x68, modifiers: 0 });
+        assert_eq!(steps(&assigned, 0, FRONT), [Step::Down(action)]);
         assert_eq!(steps(&assigned, FRONT, FRONT), [], "holding changes nothing");
-        assert_eq!(steps(&assigned, FRONT, 0), [Step::KeyUp(action)]);
+        assert_eq!(steps(&assigned, FRONT, 0), [Step::Up(action)]);
     }
 
     #[test]
@@ -542,7 +606,7 @@ mod tests {
         let assigned = assignments(&[(FRONT, 0x68, 0)]);
         assert_eq!(
             steps(&assigned, 0, BACK | FRONT),
-            [Step::SideDown(BACK), Step::KeyDown(KeyAction { usage: 0x68, modifiers: 0 })]
+            [Step::SideDown(BACK), Step::Down(Action::Key(KeyAction { usage: 0x68, modifiers: 0 }))]
         );
     }
 
@@ -559,6 +623,9 @@ mod tests {
         assert_eq!(virtual_key(0x2c), Some(0x20), "Space");
         assert_eq!(virtual_key(0x52), Some(0x26), "Up");
         assert_eq!(virtual_key(0x01), None);
+        assert_eq!(media_virtual_key(0xe9), Some(0xaf), "volume up");
+        assert_eq!(media_virtual_key(0xcd), Some(0xb3), "play / pause");
+        assert_eq!(media_virtual_key(0x01), None);
         assert_eq!(modifier_keys(0b0101), [0x11, 0x12], "ctrl and alt");
         assert_eq!(modifier_keys(0), Vec::<u16>::new());
     }
