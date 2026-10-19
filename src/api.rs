@@ -60,6 +60,7 @@ pub fn router(service: BridgeService, origins: &[String]) -> Router {
         .route("/v1/status", get(status))
         .route("/v1/handshake", put(handshake))
         .route("/v1/games", get(games))
+        .route("/v1/custom-games", get(custom_games).put(replace_custom_games))
         .route("/v1/applications", get(applications))
         .route("/v1/applications/{icon_id}/icon", get(application_icon))
         .route("/v1/running-applications", get(running_applications))
@@ -145,6 +146,23 @@ async fn profiles(State(service): State<BridgeService>) -> Json<Vec<ApplicationP
 
 async fn games(State(service): State<BridgeService>) -> Json<Vec<GameConfig>> {
     Json(service.games().await)
+}
+
+async fn custom_games(State(service): State<BridgeService>) -> Json<Vec<GameConfig>> {
+    Json(service.custom_games().await)
+}
+
+/// Replaces the user's custom games and answers with the list as saved, which
+/// is normalized and so can differ from what was sent.
+async fn replace_custom_games(
+    State(service): State<BridgeService>,
+    Json(games): Json<Vec<GameConfig>>,
+) -> Result<Json<Vec<GameConfig>>, (StatusCode, String)> {
+    service
+        .set_custom_games(games)
+        .await
+        .map(Json)
+        .map_err(internal_error)
 }
 
 async fn replace_profiles(

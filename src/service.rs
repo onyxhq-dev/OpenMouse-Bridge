@@ -116,8 +116,11 @@ fn active_profile_for(
         });
     let running_game = || {
         active_games.iter().find_map(|name| {
-            let game = config.games.iter().find(|game| &game.name == name)?;
-            enabled().find(|profile| profile_matches_game(profile, game))
+            let game = config
+                .tracked_games()
+                .into_iter()
+                .find(|game| &game.name == name)?;
+            enabled().find(|profile| profile_matches_game(profile, &game))
         })
     };
     foreground
@@ -424,6 +427,7 @@ impl BridgeService {
             .iter()
             .find(|application| application.foreground)
             .cloned();
+        let tracked_games = state.config.tracked_games();
         let active_profile =
             active_profile_for(&state.config, &state.applications, &state.active_games);
         let active_profile_is_default =
@@ -455,16 +459,14 @@ impl BridgeService {
             linux_distribution: platform::linux_distribution(),
             uptime_seconds: state.started_at.elapsed().as_secs(),
             active_games: state.active_games.clone(),
-            games: state
-                .config
-                .games
+            games: tracked_games
                 .iter()
                 .map(|game| GameActivity {
                     name: game.name.clone(),
                     active: state.active_games.iter().any(|active| active == &game.name),
                 })
                 .collect(),
-            tracked_game_count: state.config.games.len(),
+            tracked_game_count: tracked_games.len(),
             battery_threshold_percent: state.config.battery_threshold_percent,
             autostart_enabled: platform::autostart_enabled(),
             automatic_updates: state.config.automatic_updates,
@@ -511,8 +513,24 @@ impl BridgeService {
         self.inner.read().await.config.profiles.clone()
     }
 
+    /// The catalog plus the user's custom games.
     pub async fn games(&self) -> Vec<GameConfig> {
-        self.inner.read().await.config.games.clone()
+        self.inner.read().await.config.tracked_games()
+    }
+
+    pub async fn custom_games(&self) -> Vec<GameConfig> {
+        self.inner.read().await.config.custom_games.clone()
+    }
+
+    pub async fn set_custom_games(&self, games: Vec<GameConfig>) -> Result<Vec<GameConfig>> {
+        let config = {
+            let mut state = self.inner.write().await;
+            state.config.custom_games = games;
+            state.config = state.config.clone().normalized();
+            state.config.clone()
+        };
+        config::save(&self.config_path, &config)?;
+        Ok(config.custom_games)
     }
 
     pub async fn replace_profiles(&self, profiles: Vec<ApplicationProfile>) -> Result<()> {
@@ -685,7 +703,7 @@ impl BridgeService {
             let mut interval = tokio::time::interval(Duration::from_secs(3));
             loop {
                 interval.tick().await;
-                let games = service.inner.read().await.config.games.clone();
+                let games = service.inner.read().await.config.tracked_games();
                 let active = detector.detect(&games);
                 let running = applications::visible_applications();
                 let applications = registered_applications(&running, &games);

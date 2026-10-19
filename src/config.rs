@@ -30,6 +30,10 @@ pub struct BridgeConfig {
     pub notification_volume: u8,
     #[serde(default)]
     pub games: Vec<GameConfig>,
+    /// Games the user added by hand. Kept apart from `games` because the
+    /// catalog replaces that list on every start.
+    #[serde(default)]
+    pub custom_games: Vec<GameConfig>,
     #[serde(default)]
     pub profiles: Vec<ApplicationProfile>,
     #[serde(default)]
@@ -126,6 +130,7 @@ impl Default for BridgeConfig {
             notification_sound: true,
             notification_volume: DEFAULT_NOTIFICATION_VOLUME,
             games: Vec::new(),
+            custom_games: Vec::new(),
             profiles: Vec::new(),
             default_profile: None,
             allowed_origins: default_origins(),
@@ -140,22 +145,8 @@ impl BridgeConfig {
         self.battery_threshold_percent = self.battery_threshold_percent.min(100);
         self.notification_volume = self.notification_volume.min(100);
         self.alert_cooldown_minutes = self.alert_cooldown_minutes.max(1);
-        for game in &mut self.games {
-            game.name = game.name.trim().to_owned();
-            game.executables = game
-                .executables
-                .iter()
-                .map(|entry| entry.trim().to_ascii_lowercase())
-                .filter(|entry| !entry.is_empty())
-                .collect();
-            game.executables.sort();
-            game.executables.dedup();
-        }
-        self.games
-            .retain(|game| !game.name.is_empty() && !game.executables.is_empty());
-        self.games.sort_by(|left, right| left.name.cmp(&right.name));
-        self.games
-            .dedup_by(|left, right| left.name.eq_ignore_ascii_case(&right.name));
+        normalize_games(&mut self.games);
+        normalize_games(&mut self.custom_games);
         for profile in &mut self.profiles {
             profile.application.name = profile.application.name.trim().to_owned();
             profile.application.executable = profile.application.executable.trim().to_owned();
@@ -193,6 +184,36 @@ impl BridgeConfig {
         self.allowed_origins.dedup();
         self
     }
+
+    /// Every game Bridge watches: the catalog plus the user's own. A custom
+    /// game named like a catalog game is ignored so the catalog entry wins.
+    pub fn tracked_games(&self) -> Vec<GameConfig> {
+        let mut games = self.games.clone();
+        games.extend(self.custom_games.iter().filter(|custom| {
+            !self
+                .games
+                .iter()
+                .any(|game| game.name.eq_ignore_ascii_case(&custom.name))
+        }).cloned());
+        games
+    }
+}
+
+fn normalize_games(games: &mut Vec<GameConfig>) {
+    for game in games.iter_mut() {
+        game.name = game.name.trim().to_owned();
+        game.executables = game
+            .executables
+            .iter()
+            .map(|entry| entry.trim().to_ascii_lowercase())
+            .filter(|entry| !entry.is_empty())
+            .collect();
+        game.executables.sort();
+        game.executables.dedup();
+    }
+    games.retain(|game| !game.name.is_empty() && !game.executables.is_empty());
+    games.sort_by(|left, right| left.name.cmp(&right.name));
+    games.dedup_by(|left, right| left.name.eq_ignore_ascii_case(&right.name));
 }
 
 pub fn config_path() -> Result<PathBuf> {
@@ -303,6 +324,7 @@ mod tests {
             automatic_updates: false,
             notification_sound: true,
             notification_volume: 180,
+            custom_games: Vec::new(),
             profiles: Vec::new(),
             default_profile: None,
             allowed_origins: Vec::new(),
@@ -325,6 +347,27 @@ mod tests {
                 .iter()
                 .any(|origin| origin == "https://control.openmouse.app")
         );
+    }
+
+    #[test]
+    fn custom_games_are_tracked_beside_the_catalog_and_the_catalog_wins_name_clashes() {
+        let game = |name: &str, exe: &str| GameConfig {
+            name: name.into(),
+            executables: vec![exe.into()],
+        };
+        let config = BridgeConfig {
+            games: vec![game("Valorant", "valorant.exe")],
+            custom_games: vec![game("My Game", " MyGame.EXE "), game("valorant", "other.exe")],
+            ..BridgeConfig::default()
+        }
+        .normalized();
+        let names: Vec<_> = config
+            .tracked_games()
+            .into_iter()
+            .map(|game| game.name)
+            .collect();
+        assert_eq!(names, ["Valorant", "My Game"]);
+        assert_eq!(config.custom_games[0].executables, ["mygame.exe"]);
     }
 
     #[test]
