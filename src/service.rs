@@ -1430,6 +1430,18 @@ impl BridgeService {
         reading.percent = percent;
         let alert = {
             let mut state = self.inner.write().await;
+            let others = same_mouse_through(state.known.devices(), &reading);
+            if reading.native {
+                if let Some((id, name)) = others.into_iter().next() {
+                    reading.device_id = id;
+                    reading.device_name = name;
+                }
+            } else {
+                for (id, _) in others {
+                    state.known.forget(&id);
+                    state.battery.remove(&id);
+                }
+            }
             let threshold = state.config.battery_threshold_percent;
             let cooldown = Duration::from_secs(state.config.alert_cooldown_minutes * 60);
             let previous = state.battery.get(&reading.device_id);
@@ -1932,6 +1944,21 @@ fn names_match(a: &str, b: &str) -> bool {
         (&b, &a)
     };
     short.len() >= 2 && short.iter().all(|word| long.contains(word))
+}
+
+fn same_mouse_through(known: &[KnownDevice], reading: &BatteryReading) -> Vec<(String, String)> {
+    let Some(via) = reading.via.as_deref() else {
+        return Vec::new();
+    };
+    known
+        .iter()
+        .filter(|device| {
+            device.via.as_deref() == Some(via)
+                && device.id != reading.device_id
+                && !brand_of(&device.id).eq_ignore_ascii_case(brand_of(&reading.device_id))
+        })
+        .map(|device| (device.id.clone(), device.name.clone()))
+        .collect()
 }
 
 /// Whether a mouse found on the bus is the remembered `device`: the same id,
@@ -3270,6 +3297,44 @@ mod tests {
             switch_mode: None,
             ..Default::default()
         }
+    }
+
+    #[tokio::test]
+    async fn one_mouse_named_by_two_brands_through_one_receiver_is_one_row() {
+        let bridge = BridgeService::new(BridgeConfig::default(), temp_config_path());
+        let via = || Some("Lingbao:3151:402d".to_owned());
+        let native = || BatteryReading {
+            via: via(),
+            native: true,
+            ..reading("Lingbao:GearHub V5 mouse", "GearHub V5 mouse", 100)
+        };
+        bridge.record_battery(native()).await.unwrap();
+        bridge
+            .record_battery(BatteryReading {
+                via: via(),
+                ..reading("AJAZZ:AJAZZ AJ179 PRO", "AJAZZ AJ179 PRO", 100)
+            })
+            .await
+            .unwrap();
+        bridge.record_battery(native()).await.unwrap();
+        bridge
+            .record_battery(BatteryReading {
+                via: via(),
+                ..reading("AJAZZ:AJAZZ AJ199", "AJAZZ AJ199", 50)
+            })
+            .await
+            .unwrap();
+        let state = bridge.inner.read().await;
+        let rows: Vec<_> = state
+            .known
+            .devices()
+            .iter()
+            .map(|d| d.id.as_str())
+            .collect();
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        assert!(rows.contains(&"AJAZZ:AJAZZ AJ179 PRO"));
+        assert!(rows.contains(&"AJAZZ:AJAZZ AJ199"));
+        assert!(!state.battery.contains_key("Lingbao:GearHub V5 mouse"));
     }
 
     #[tokio::test]
